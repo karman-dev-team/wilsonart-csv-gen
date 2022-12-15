@@ -6,10 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"mime/multipart"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -64,16 +62,23 @@ type HubspotLineItem struct {
 	} `json:"properties"`
 }
 
-type content struct {
-	fname string
-	ftype string
-	fdata []byte
+type hubspotNoteProperties struct {
+	hsTimestamp time.Time
+	hsNoteBody  string
 }
 
 var HubspotAPIKey string
+var azureSignature string
+var azureContainer string
+var azureBucket string
+var googleChatUrl string
 
 func main() {
 	HubspotAPIKey = os.Getenv("HUBSPOT_API_KEY")
+	azureSignature = os.Getenv("AZURE_SIG")
+	azureBucket = os.Getenv("AZURE_BUCKET")
+	azureContainer = os.Getenv("AZURE_CONTAINER")
+	googleChatUrl = os.Getenv("GOOGLE_CHAT_URL")
 	r := gin.Default()
 	r.POST("/generate-csv", GenerateCSV)
 	r.Run()
@@ -84,34 +89,38 @@ func GenerateCSV(c *gin.Context) {
 
 	err := c.ShouldBindJSON(&payloadBody)
 	if err != nil {
+		logToGChat(err.Error())
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	dealData, err := getDealData(payloadBody.ObjectID)
 	if err != nil {
+		logToGChat(fmt.Sprintf("Error getting deal: %d with error: %s", payloadBody.ObjectID, err.Error()))
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	companyID, err := strconv.ParseInt(dealData.Associations.Companies.Results[0].ID, 10, 64)
 	if err != nil {
+		logToGChat(fmt.Sprintf("Error no company associated to deal: %d with error: %s", payloadBody.ObjectID, err.Error()))
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	companyData, err := getCompanyData(companyID)
 	if err != nil {
+		logToGChat(fmt.Sprintf("Error getting company data of company: %d with error: %s", companyID, err.Error()))
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	lineItems, err := getAssociatedLineItems(payloadBody.ObjectID)
 	if err != nil {
+		logToGChat(fmt.Sprintf("Error getting lineitems of deal: %d with error: %s", payloadBody.ObjectID, err.Error()))
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
 	fileText := fmt.Sprintf(`"TYP","ORD","IN","2"
 "HDR","1","2","2CH002","","","","%s","%s","%s","","","%s","%d","%s","%s","","00:00","00:00","","","%s","","","%d","1","1","","","","","","","","","",""
 `, companyData.Properties.Name, companyData.Properties.Address, companyData.Properties.Address2, companyData.Properties.Zip, payloadBody.ObjectID, dealData.Properties.Createdate.Format("02/01/2006"), dealData.Properties.Createdate.Format("02/01/2006"), dealData.Properties.Createdate.Format("02/01/2006"), payloadBody.ObjectID)
@@ -119,42 +128,83 @@ func GenerateCSV(c *gin.Context) {
 		fileText = fileText + fmt.Sprintf(`"LNE","%d","%s","","","","%s","%s","1","%s","","","","%d"
 `, i, item.Properties.HsSku, item.Properties.Name, item.Properties.Name, item.Properties.Quantity, i)
 	}
-	// fmt.Println(fileText)
 	fileText = fileText + "EOF"
-
-	fileBinary := content{
-		fname: fmt.Sprintf("%d-%s.txt", payloadBody.ObjectID, time.Now().Format("02-01-2006_1504")),
-		ftype: "text",
-		fdata: []byte(fileText),
-	}
-
-	var (
-		buf = new(bytes.Buffer)
-		w   = multipart.NewWriter(buf)
-	)
-
-	part, err := w.CreateFormFile(fileBinary.ftype, filepath.Base(fileBinary.fname))
+	fileName := fmt.Sprintf("%d-%s.txt", payloadBody.ObjectID, time.Now().Format("02-01-2006_1504"))
+	err = uploadTextFile(fileText, fileName)
 	if err != nil {
+		logToGChat(fmt.Sprintf("Error uploading text file with error: %s", err.Error()))
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	part.Write(fileBinary.fdata)
-	w.Close()
+}
 
-	req, err := http.NewRequest("PUT", "https://testingcsv.blob.core.windows.net/?sv=2021-06-08&ss=bfqt&srt=sco&sp=w&se=2024-03-30T22:21:56Z&st=2022-12-15T14:21:56Z&spr=https&sig=y1CBxjHw4W%2B6HSRFeEbk8d7e%2BWQYyJZnXIJeOyk6WsQ%3D", buf)
+func createNoteHubspot(errText string, dealId int64) error {
+	body := struct {
+		Properties hubspotNoteProperties
+	}{
+		Properties: hubspotNoteProperties{
+			hsTimestamp: time.Now().UTC(),
+			hsNoteBody:  errText,
+		},
+	}
+
+	bodyJSON, err := json.Marshal(body)
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return err
+	}
+
+	req, err := http.NewRequest("POST", "https://api.hubapi.com/crm/v3/objects/notes", bytes.NewBuffer(bodyJSON))
+	if err != nil {
+		return err
+	}
+	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", ""))
+	req.Header.Add("content-type", "application/json")
+	return nil
+}
+
+func logToGChat(errText string) {
+	body := struct {
+		Text string `json:"text"`
+	}{
+		Text: "WilsonArt Error:" + errText,
+	}
+	bodyJSON, err := json.Marshal(body)
+	if err != nil {
 		return
 	}
-	req.Header.Add("Content-Type", w.FormDataContentType())
+
+	req, err := http.NewRequest("POST", googleChatUrl, bytes.NewBuffer(bodyJSON))
+	if err != nil {
+		return
+	}
+	req.Header.Add("Content-Type", "application/json")
 	client := &http.Client{}
 	res, err := client.Do(req)
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	fmt.Println(res.Status)
 	defer res.Body.Close()
+}
+
+func uploadTextFile(fData string, fName string) error {
+
+	buf := new(bytes.Buffer)
+
+	buf.WriteString(fData)
+
+	req, err := http.NewRequest("PUT", fmt.Sprintf("https://%s.blob.core.windows.net/%s/%s?sv=2021-06-08&ss=bfqt&srt=sco&sp=w&se=2024-03-30T22:21:56Z&st=2022-12-15T14:21:56Z&sip=213.122.115.161&spr=https&sig=%s", azureBucket, azureContainer, fName, azureSignature), buf)
+	if err != nil {
+		return err
+	}
+	req.Header.Add("Content-Type", "text/plain")
+	req.Header.Add("x-ms-blob-type", "BlockBlob")
+	client := &http.Client{}
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	return nil
 }
 
 func getDealData(dealID int64) (HubspotDealBody, error) {
